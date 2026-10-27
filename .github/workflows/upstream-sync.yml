@@ -1,0 +1,68 @@
+name: sync upstream
+
+# 每天把 PAICNI/CFNext 的 main 合并进本 fork，保持「全量最新」。
+# 用 merge 而不是 force-push：永不丢东西，冲突时失败告警而不是覆盖。
+# 上游没新提交时直接跳过，不产生空提交。
+# 不需要任何 Secret —— 用仓库自带的 GITHUB_TOKEN（只作用于本 fork）。
+on:
+  schedule:
+    - cron: "0 18 * * *"      # UTC 18:00 = 北京 02:00，早于两个产物仓
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: PAICNI/CFNext
+  UPSTREAM_BRANCH: main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 比对上游与本地
+        id: check
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
+          git fetch --quiet upstream "$UPSTREAM_BRANCH"
+          LOCAL=$(git rev-parse HEAD)
+          UPSTREAM=$(git rev-parse "upstream/$UPSTREAM_BRANCH")
+          echo "local   =$LOCAL"
+          echo "upstream=$UPSTREAM"
+          if [ "$LOCAL" = "$UPSTREAM" ]; then
+            echo "::notice::已与上游一致，跳过"
+            echo "behind=false" >> "$GITHUB_OUTPUT"
+          elif git merge-base --is-ancestor "$UPSTREAM" "$LOCAL"; then
+            echo "::notice::本地已包含上游全部提交（仅多出本同步工作流），跳过"
+            echo "behind=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "behind=true" >> "$GITHUB_OUTPUT"
+            echo "upstream=$UPSTREAM" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 合并上游
+        if: steps.check.outputs.behind == 'true'
+        run: |
+          set -euo pipefail
+          if ! git merge --no-edit "upstream/$UPSTREAM_BRANCH"; then
+            echo "::error::与上游合并冲突，已保留现场未提交。请人工处理后再恢复定时同步。"
+            git merge --abort || true
+            exit 1
+          fi
+          git log --oneline -3
+
+      - name: 推送
+        if: steps.check.outputs.behind == 'true'
+        run: |
+          set -euo pipefail
+          git push origin "HEAD:${{ github.ref_name }}"
+          echo "::notice::已同步到上游 ${{ steps.check.outputs.upstream }}"
